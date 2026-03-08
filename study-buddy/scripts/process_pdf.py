@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-PDF Extractor — 4-chunk CLI mode with Gemini CLI + Claude CLI fallback.
+PDF Extractor — adaptive chunking with Gemini CLI + Claude CLI fallback.
 
-Splits each PDF into exactly 4 equal chunks and makes exactly 4 CLI calls per PDF.
+Splits each PDF into chunks of at most MAX_PAGES_PER_CHUNK pages (default 20).
+Large PDFs automatically get more chunks to avoid API timeouts.
+Timeout scales with chunk size. On timeout, the chunk is automatically split
+in half and retried (up to MAX_SPLIT_DEPTH times).
 Automatic model fallback: Gemini models (CLI) -> Claude models (Claude Code CLI).
 Never writes error text to output files.
 
@@ -21,6 +24,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import re
 import subprocess
@@ -45,10 +49,15 @@ CLAUDE_MODELS = [
     "claude-haiku-4-5-20251001",
 ]
 
-NUM_CHUNKS = 4
+MIN_CHUNKS = 4           # minimum number of chunks even for small PDFs
+MAX_PAGES_PER_CHUNK = 20 # hard cap: never send more than this many pages in one call
 DPI = 150
 MAX_RETRIES = 3
-BACKOFF_BASE = 20.0  # seconds; doubles each retry
+BACKOFF_BASE = 20.0      # seconds; doubles each retry
+TIMEOUT_PER_PAGE = 30    # seconds per page for adaptive timeout
+MIN_TIMEOUT = 180        # floor timeout (seconds)
+MAX_TIMEOUT = 900        # ceiling timeout (seconds) — 15 minutes
+MAX_SPLIT_DEPTH = 3      # max halvings when a chunk times out
 
 
 # ── CLI helpers ───────────────────────────────────────────────────────────────
@@ -68,7 +77,12 @@ def _is_rate_limit(text: str) -> bool:
     ))
 
 
-def run_gemini_cli(model: str, prompt: str, timeout: int = 300) -> str:
+def adaptive_timeout(num_pages: int) -> int:
+    """Compute a timeout (seconds) scaled to the number of pages in the chunk."""
+    return max(MIN_TIMEOUT, min(MAX_TIMEOUT, num_pages * TIMEOUT_PER_PAGE))
+
+
+def run_gemini_cli(model: str, prompt: str, timeout: int = MIN_TIMEOUT) -> str:
     # Use positional argument (one-shot mode) instead of -p to avoid agentic mode
     # where Gemini responds "I'm ready for your command" instead of extracting content.
     cmd = _wrap(["gemini", "--model", model, "-o", "text", prompt])
@@ -85,7 +99,7 @@ def run_gemini_cli(model: str, prompt: str, timeout: int = 300) -> str:
     return text
 
 
-def run_claude_cli(model: str, prompt: str, timeout: int = 300) -> str:
+def run_claude_cli(model: str, prompt: str, timeout: int = MIN_TIMEOUT) -> str:
     cmd = _wrap([
         "claude", "--model", model, "-p", prompt,
         "--dangerously-skip-permissions",
@@ -163,28 +177,29 @@ def render_chunk_to_files(
 
 # ── Fallback extraction ───────────────────────────────────────────────────────
 
-def extract_chunk_with_fallback(
-    chunk_idx: int,
-    page_nums: list[int],
-    img_paths: list[Path],
-) -> str:
+def _try_all_models(label: str, page_nums: list[int], img_paths: list[Path]) -> str:
     """
-    Try every Gemini model then every Claude model via CLI.
-    Raises RuntimeError only if ALL models are exhausted — never returns error text.
+    Try every Gemini model then every Claude model via CLI with adaptive timeout.
+    Returns extracted text or raises RuntimeError if all models fail.
+    Does NOT handle chunk splitting — that is done by the caller.
     """
-    label = f"Chunk {chunk_idx + 1}/{NUM_CHUNKS} (slides {page_nums[0]}-{page_nums[-1]})"
+    timeout = adaptive_timeout(len(page_nums))
 
     for model in GEMINI_MODELS:
         prompt = build_gemini_prompt(page_nums, img_paths)
         for attempt in range(MAX_RETRIES):
             try:
-                print(f"  [{label}] gemini --model {model} (attempt {attempt + 1})...", flush=True)
-                text = run_gemini_cli(model, prompt)
+                print(
+                    f"  [{label}] gemini --model {model} (attempt {attempt + 1}, "
+                    f"timeout {timeout}s for {len(page_nums)} pages)...",
+                    flush=True,
+                )
+                text = run_gemini_cli(model, prompt, timeout=timeout)
                 print(f"  [{label}] Done via gemini ({model})", flush=True)
                 return text
             except subprocess.TimeoutExpired:
-                print(f"  [{label}] {model} timed out", flush=True)
-                break  # try next model
+                print(f"  [{label}] {model} timed out after {timeout}s", flush=True)
+                raise  # propagate timeout so caller can split the chunk
             except Exception as exc:
                 err = str(exc)
                 if _is_rate_limit(err) and attempt < MAX_RETRIES - 1:
@@ -193,7 +208,7 @@ def extract_chunk_with_fallback(
                     time.sleep(wait)
                 else:
                     print(f"  [{label}] {model} failed: {err[:120]}", flush=True)
-                    break  # non-rate-limit error or retries exhausted — try next model
+                    break  # try next model
 
     print(f"  [{label}] All Gemini models failed. Switching to Claude CLI...", flush=True)
 
@@ -201,13 +216,17 @@ def extract_chunk_with_fallback(
         prompt = build_claude_prompt(page_nums, img_paths)
         for attempt in range(MAX_RETRIES):
             try:
-                print(f"  [{label}] claude --model {model} (attempt {attempt + 1})...", flush=True)
-                text = run_claude_cli(model, prompt)
+                print(
+                    f"  [{label}] claude --model {model} (attempt {attempt + 1}, "
+                    f"timeout {timeout}s for {len(page_nums)} pages)...",
+                    flush=True,
+                )
+                text = run_claude_cli(model, prompt, timeout=timeout)
                 print(f"  [{label}] Done via claude ({model})", flush=True)
                 return text
             except subprocess.TimeoutExpired:
-                print(f"  [{label}] {model} timed out", flush=True)
-                break
+                print(f"  [{label}] {model} timed out after {timeout}s", flush=True)
+                raise  # propagate timeout so caller can split the chunk
             except Exception as exc:
                 err = str(exc)
                 if attempt < MAX_RETRIES - 1:
@@ -222,6 +241,43 @@ def extract_chunk_with_fallback(
         f"All Gemini and Claude models failed for {label}. "
         "Check that 'gemini' and 'claude' CLIs are installed and authenticated."
     )
+
+
+def extract_chunk_with_fallback(
+    chunk_label: str,
+    page_nums: list[int],
+    img_paths: list[Path],
+    split_depth: int = 0,
+) -> str:
+    """
+    Extract a chunk of slides.  On timeout, automatically splits the chunk in
+    half and retries each half (up to MAX_SPLIT_DEPTH halvings).
+    Raises RuntimeError only if ALL models AND all splits are exhausted.
+    """
+    label = f"{chunk_label}[d{split_depth}]" if split_depth else chunk_label
+    try:
+        return _try_all_models(label, page_nums, img_paths)
+    except subprocess.TimeoutExpired:
+        if split_depth >= MAX_SPLIT_DEPTH or len(page_nums) <= 1:
+            raise RuntimeError(
+                f"Timeout on {label} ({len(page_nums)} pages) even at minimum split size. "
+                "Try reducing DPI (--dpi 100) or processing a smaller page range."
+            )
+        mid = len(page_nums) // 2
+        left_pages, right_pages = page_nums[:mid], page_nums[mid:]
+        left_imgs, right_imgs = img_paths[:mid], img_paths[mid:]
+        print(
+            f"  [{label}] Timeout — splitting into two sub-chunks of "
+            f"{len(left_pages)} and {len(right_pages)} pages and retrying...",
+            flush=True,
+        )
+        left_text = extract_chunk_with_fallback(
+            f"{chunk_label}L", left_pages, left_imgs, split_depth + 1
+        )
+        right_text = extract_chunk_with_fallback(
+            f"{chunk_label}R", right_pages, right_imgs, split_depth + 1
+        )
+        return left_text + "\n\n" + right_text
 
 
 # ── Response parsing ──────────────────────────────────────────────────────────
@@ -314,14 +370,15 @@ def process_single_pdf(pdf_path: Path, args) -> Path:
         print(f"[{pdf_path.name}] All {len(all_indices)} pages already extracted — nothing to do.")
         return output_path
 
-    # Split into exactly NUM_CHUNKS (or fewer if PDF has very few pages)
-    n_chunks = min(NUM_CHUNKS, len(needed))
-    chunk_size = (len(needed) + n_chunks - 1) // n_chunks
+    # Adaptive chunking: use at least MIN_CHUNKS but cap each chunk at MAX_PAGES_PER_CHUNK
+    n_chunks = max(MIN_CHUNKS, math.ceil(len(needed) / MAX_PAGES_PER_CHUNK))
+    n_chunks = min(n_chunks, len(needed))  # never more chunks than pages
+    chunk_size = math.ceil(len(needed) / n_chunks)
     chunks = [needed[i : i + chunk_size] for i in range(0, len(needed), chunk_size)]
 
     print(
         f"[{pdf_path.name}] {len(needed)} pages -> {len(chunks)} chunk(s) "
-        f"(~{chunk_size} pages/chunk, {len(chunks)} API call(s))"
+        f"(~{chunk_size} pages/chunk, adaptive timeout ~{adaptive_timeout(chunk_size)}s/chunk)"
     )
 
     new_slides: dict[int, str] = {}
@@ -344,8 +401,9 @@ def process_single_pdf(pdf_path: Path, args) -> Path:
             # Render pages to temp PNG files
             img_paths = render_chunk_to_files(pdf_path, page_indices, tmp_dir, dpi=args.dpi)
 
-            # Run CLI extraction (raises only if all models exhausted)
-            raw_text = extract_chunk_with_fallback(chunk_idx, page_nums, img_paths)
+            # Run CLI extraction (raises only if all models and splits exhausted)
+            chunk_label = f"Chunk {chunk_idx + 1}/{len(chunks)} (slides {page_nums[0]}-{page_nums[-1]})"
+            raw_text = extract_chunk_with_fallback(chunk_label, page_nums, img_paths)
 
             # Clean up temp images for this chunk immediately
             for p in img_paths:

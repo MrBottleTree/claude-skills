@@ -29,7 +29,7 @@ python "C:/Users/vishr/.claude/skills/study-buddy/scripts/convert_to_pdf.py" --s
 This recursively finds every `.ppt`, `.pptx`, `.odp`, `.pps`, `.ppsx`, `.doc`, `.docx`, `.odt` file and converts them all to PDF in parallel (4 workers by default).
 
 **Step 2 — Extract all PDFs (one at a time, skip already-extracted):**
-Use Glob to find every `.pdf` in the working directory tree, then pass them **one at a time** to `process_pdf.py`. Each PDF is split into exactly 4 chunks (4 API calls).
+Use Glob to find every `.pdf` in the working directory tree, then pass them **one at a time** to `process_pdf.py`. Each PDF is split into chunks of at most 20 pages (adaptive — large PDFs get more chunks automatically).
 ```bash
 # Loop through PDFs one at a time — do NOT pass multiple PDFs at once
 python "C:/Users/vishr/.claude/skills/study-buddy/scripts/process_pdf.py" "slides1.pdf" --resume
