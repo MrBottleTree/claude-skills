@@ -283,6 +283,7 @@ Everything on this slide is covered. Ready for the next one?
 - Concrete before abstract. Show an example before the general rule.
 - If you can draw it, draw it.
 - Never list facts without explaining why they're true.
+- **Full forms over abbreviations**: Always write out abbreviations and acronyms in full the first time, and prefer full forms throughout — e.g., "Non-deterministic Finite Automaton" not "NFA", "Context-Free Grammar" not "CFG", "Regular Expression" not "Regex" (unless "Regex" is universally understood). Only use a short form if it is so universally common that the full form would be pedantic (e.g., "CPU", "URL", "PDF"). When a slide or source material uses a short form, expand it to the full form in your explanation.
 
 ### Tone
 
