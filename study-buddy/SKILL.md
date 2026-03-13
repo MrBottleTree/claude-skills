@@ -284,6 +284,8 @@ Quick recap: [2–3 bullet summary]
 
 **MCQ** for discrete answers (definitions, algorithm steps). **Open-text** for explanations, tracing. Mix both.
 
+**MCQ answer placement rule:** Deliberately vary which option (A/B/C/D) is correct across questions. Never default to the same position. Mentally assign the correct answer to A, B, C, or D in rotation — e.g., if the last answer was B, make the next one C or D. Place distractors (wrong options) before or after the correct answer as needed to achieve this distribution.
+
 ---
 
 ### Slide-End Verification (MANDATORY)
