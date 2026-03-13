@@ -9,6 +9,13 @@ in half and retried (up to MAX_SPLIT_DEPTH times).
 Automatic model fallback: Gemini models (CLI) -> Claude models (Claude Code CLI).
 Never writes error text to output files.
 
+Output structure (per-slide directory):
+    slides_extracted/
+        index.md           ← metadata + slide listing
+        slide_0001.md      ← content for slide 1
+        slide_0002.md      ← content for slide 2
+        ...
+
 Requirements:
     pip install pymupdf Pillow
     gemini CLI:  npm install -g @google/gemini-cli  (must be authenticated)
@@ -17,7 +24,7 @@ Requirements:
 Usage:
     python process_pdf.py slides.pdf
     python process_pdf.py slides.pdf --resume
-    python process_pdf.py slides.pdf --output out.md
+    python process_pdf.py slides.pdf --output ./my_output_dir
     python process_pdf.py slides.pdf --end-page 41
     python process_pdf.py --clear-cache              # delete ALL cached extractions in cwd
     python process_pdf.py slides.pdf --clear-cache   # delete extraction for this PDF only
@@ -27,6 +34,7 @@ import argparse
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -308,16 +316,27 @@ def parse_batch_response(text: str, page_nums: list[int]) -> dict[int, str]:
 # ── Cache management ──────────────────────────────────────────────────────────
 
 def clear_cache(directory: Path, specific_pdfs: list[Path] | None = None) -> None:
-    """Delete _extracted.md files and leftover temp PNGs."""
+    """Delete extracted directories, legacy _extracted.md files, and temp PNGs."""
     deleted = []
 
     if specific_pdfs:
         for pdf in specific_pdfs:
-            target = pdf.parent / (pdf.stem + "_extracted.md")
-            if target.exists():
-                target.unlink()
-                deleted.append(target)
+            # New format: per-slide directory
+            target_dir = pdf.parent / (pdf.stem + "_extracted")
+            if target_dir.exists() and target_dir.is_dir():
+                shutil.rmtree(target_dir, ignore_errors=True)
+                deleted.append(target_dir)
+            # Legacy format: single .md file
+            target_md = pdf.parent / (pdf.stem + "_extracted.md")
+            if target_md.exists():
+                target_md.unlink()
+                deleted.append(target_md)
     else:
+        for d in directory.rglob("*_extracted"):
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                deleted.append(d)
+        # Legacy format cleanup
         for f in directory.rglob("*_extracted.md"):
             f.unlink()
             deleted.append(f)
@@ -325,7 +344,6 @@ def clear_cache(directory: Path, specific_pdfs: list[Path] | None = None) -> Non
     # Clean up any stray temp PNG dirs
     for d in directory.rglob("_sb_tmp_*"):
         if d.is_dir():
-            import shutil
             shutil.rmtree(d, ignore_errors=True)
             deleted.append(d)
 
@@ -337,17 +355,57 @@ def clear_cache(directory: Path, specific_pdfs: list[Path] | None = None) -> Non
         print("No cached files found to clear.")
 
 
+# ── Per-slide directory output ─────────────────────────────────────────────────
+
+def get_output_dir(pdf_path: Path, args) -> Path:
+    if hasattr(args, "output") and args.output:
+        return Path(args.output).resolve()
+    return pdf_path.parent / (pdf_path.stem + "_extracted")
+
+
+def load_existing_slides(output_dir: Path) -> set[int]:
+    """Return the set of slide numbers already written to output_dir."""
+    existing = set()
+    if output_dir.exists():
+        for f in output_dir.glob("slide_*.md"):
+            m = re.match(r"slide_(\d+)\.md$", f.name)
+            if m:
+                existing.add(int(m.group(1)))
+    return existing
+
+
+def write_slide(output_dir: Path, pn: int, text: str) -> None:
+    """Write a single slide's content to its own file."""
+    slide_path = output_dir / f"slide_{pn:04d}.md"
+    slide_path.write_text(f"## Slide {pn}\n\n{text}", encoding="utf-8")
+
+
+def write_index(output_dir: Path, pdf_name: str, total_pages: int,
+                start_page: int, end_page: int, dpi: int,
+                extracted_pages: list[int]) -> None:
+    """Write/overwrite index.md with current extraction metadata."""
+    lines = [
+        f"# Extracted: {pdf_name}",
+        f"- Total pages: {total_pages}",
+        f"- Extracted range: {start_page} to {end_page}",
+        f"- DPI: {dpi}",
+        f"- Slides extracted: {len(extracted_pages)}",
+        "",
+        "## Slide Index",
+    ]
+    for pn in sorted(extracted_pages):
+        lines.append(f"- slide_{pn:04d}.md — Slide {pn}")
+    (output_dir / "index.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 # ── Single PDF extraction ─────────────────────────────────────────────────────
 
 def process_single_pdf(pdf_path: Path, args) -> Path:
-    """Extract one PDF with exactly NUM_CHUNKS API calls. Returns output path."""
+    """Extract one PDF into a per-slide directory. Returns output directory path."""
     import fitz
 
-    output_path = (
-        Path(args.output).resolve()
-        if (hasattr(args, "output") and args.output)
-        else pdf_path.parent / (pdf_path.stem + "_extracted.md")
-    )
+    output_dir = get_output_dir(pdf_path, args)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     doc = fitz.open(str(pdf_path))
     total_pages = len(doc)
@@ -357,18 +415,17 @@ def process_single_pdf(pdf_path: Path, args) -> Path:
     end_idx = min(args.end_page, total_pages) if args.end_page else total_pages
     all_indices = list(range(start_idx, end_idx))
 
-    # Load already-extracted slides when resuming
-    existing: dict[int, str] = {}
-    if args.resume and output_path.exists():
-        txt = output_path.read_text(encoding="utf-8")
-        for m in re.finditer(r"## Slide (\d+)\n\n(.*?)\n\n---", txt, re.DOTALL):
-            existing[int(m.group(1))] = m.group(2)
-        print(f"[{pdf_path.name}] Resuming — {len(existing)} slides already cached")
+    # Resume: find which slide files already exist
+    existing: set[int] = set()
+    if args.resume:
+        existing = load_existing_slides(output_dir)
+        if existing:
+            print(f"[{pdf_path.name}] Resuming — {len(existing)} slides already extracted")
 
     needed = [i for i in all_indices if (i + 1) not in existing]
     if not needed:
         print(f"[{pdf_path.name}] All {len(all_indices)} pages already extracted — nothing to do.")
-        return output_path
+        return output_dir
 
     # Adaptive chunking: use at least MIN_CHUNKS but cap each chunk at MAX_PAGES_PER_CHUNK
     n_chunks = max(MIN_CHUNKS, math.ceil(len(needed) / MAX_PAGES_PER_CHUNK))
@@ -420,28 +477,25 @@ def process_single_pdf(pdf_path: Path, args) -> Path:
                         if pn == page_nums[0]
                         else f"[Extracted as part of batch with slides {page_nums[0]}-{page_nums[-1]}. See slide {page_nums[0]} for full batch text if parsing failed.]"
                     )
+
+                # Write each slide immediately (so partial extractions are saved on crash)
+                write_slide(output_dir, pn, parsed[pn])
                 new_slides[pn] = parsed[pn]
 
     finally:
         # Always clean up temp dir
-        import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Merge with existing, sort, write output
-    all_slides = {**existing, **new_slides}
-    header = (
-        f"# Extracted Content: {pdf_path.name}\n"
-        f"- Total pages: {total_pages}\n"
-        f"- Extracted range: {args.start_page} to {args.end_page or total_pages}\n"
-        f"- DPI: {args.dpi}\n\n"
+    # Write/update index.md with all extracted slides
+    all_extracted = sorted(existing | set(new_slides.keys()))
+    write_index(
+        output_dir, pdf_path.name, total_pages,
+        args.start_page, args.end_page or total_pages,
+        args.dpi, all_extracted,
     )
-    body = "".join(
-        f"\n\n## Slide {pn}\n\n{text}\n\n---"
-        for pn, text in sorted(all_slides.items())
-    )
-    output_path.write_text(header + body, encoding="utf-8")
-    print(f"\n[{pdf_path.name}] Done — {len(new_slides)} slides written to {output_path}")
-    return output_path
+
+    print(f"\n[{pdf_path.name}] Done — {len(new_slides)} slides written to {output_dir}/")
+    return output_dir
 
 
 # ── Dependency check ──────────────────────────────────────────────────────────
@@ -463,21 +517,21 @@ def check_dependencies() -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract PDF slides — 4-chunk Gemini/Claude CLI mode",
+        description="Extract PDF slides — per-slide directory output with Gemini/Claude CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("pdfs", nargs="*", help="PDF file(s) to extract (processed one at a time)")
-    parser.add_argument("--output", "-o", help="Output .md path (single PDF only)")
+    parser.add_argument("--output", "-o", help="Output directory path (single PDF only)")
     parser.add_argument("--start-page", type=int, default=1, help="First page, 1-indexed (default: 1)")
     parser.add_argument("--end-page", type=int, default=None, help="Last page inclusive (default: last)")
     parser.add_argument("--dpi", type=int, default=DPI, help=f"Render DPI (default: {DPI})")
-    parser.add_argument("--resume", action="store_true", help="Skip pages already present in output file")
+    parser.add_argument("--resume", action="store_true", help="Skip slides already present in output directory")
     parser.add_argument(
         "--clear-cache",
         action="store_true",
         help=(
-            "Delete all *_extracted.md files and temp dirs in the current directory. "
+            "Delete all *_extracted/ directories (and legacy *_extracted.md files) in the current directory. "
             "If PDF(s) are also given, only clear those specific extractions."
         ),
     )
